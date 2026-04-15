@@ -9,7 +9,7 @@ Open http://<pi-ip>:8080 in a browser. Hold SPACE to activate the policy.
 Releasing SPACE (or losing browser focus) immediately stops the car.
 
 Dependencies:
-    pip install aiohttp onnxruntime ArducamDepthCamera opencv-python "numpy<2.0.0" ev3_dc
+    pip install aiohttp onnxruntime ArducamDepthCamera opencv-python "numpy<2.0.0"
 """
 
 import asyncio
@@ -22,9 +22,10 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 import ArducamDepthCamera as ac
-import ev3_dc as ev3
 import aiohttp
 from aiohttp import web
+
+from hardware import Robot
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -34,24 +35,23 @@ POLICY_PATH = os.path.join(SCRIPT_DIR, "Policy", "policy.onnx")
 HOST           = "0.0.0.0"
 PORT           = 8080
 CAMERA_INDICES = [0, 8]
-MAX_DISTANCE   = 4000   # mm — sensor range limit
+MAX_DISTANCE   = 2000   # mm — sensor range limit
 CONF_THRESHOLD = 30
 WARMUP_FRAMES  = 10
-DRIVE_SPEED    = 100
-STEER_SPEED    = 50
 FPS_TARGET     = 15     # browser stream fps
 POLICY_HZ      = 30
 
 # ── Depth processing constants (must match training pipeline) ─────────────────
 DEPTH_RAW_H    = 180
 DEPTH_RAW_W    = 240
-CROP_TOP_FRAC  = 0.625          # remove top 47.5%
-POLICY_W       = 80
-# Crop: use int() truncation — mirrors sim's `int(fraction * h)` in _process_depth_frame.
-CROP_TOP_ROWS  = int(CROP_TOP_FRAC * DEPTH_RAW_H)                                   # 85 rows removed
-CROPPED_H      = DEPTH_RAW_H - CROP_TOP_ROWS                                        # 95 rows remain
-# Policy height: mirrors sim __init__ which uses int() on the remaining fraction.
-POLICY_H       = round(POLICY_W * int(DEPTH_RAW_H * (1.0 - CROP_TOP_FRAC)) / DEPTH_RAW_W)  # 31
+CROP_TOP_FRAC    = 0.35
+CROP_BOTTOM_FRAC = 0.3
+POLICY_W         = 120
+# Crop: int() truncation mirrors sim's _process_depth_frame
+CROP_TOP_ROWS    = int(CROP_TOP_FRAC    * DEPTH_RAW_H)
+CROP_BOTTOM_ROWS = int(CROP_BOTTOM_FRAC * DEPTH_RAW_H)
+CROPPED_H        = DEPTH_RAW_H - CROP_TOP_ROWS - CROP_BOTTOM_ROWS
+POLICY_H         = round(POLICY_W * CROPPED_H / DEPTH_RAW_W)
 
 # ── Policy observation layout ─────────────────────────────────────────────────
 PER_CAM_DIM    = POLICY_W * POLICY_H   # 80*31 = 2480
@@ -74,7 +74,7 @@ space_active = threading.Event()
 latest_action = [0.0, 0.0]
 action_lock   = threading.Lock()
 
-robot: "Robot | None" = None
+robot: Robot | None = None
 
 
 # ── Depth processing ──────────────────────────────────────────────────────────
@@ -93,151 +93,72 @@ def depth_to_jpeg(depth_buf: np.ndarray, conf_buf: np.ndarray, depth_range: floa
 
 def process_for_policy(depth_buf: np.ndarray, conf_buf: np.ndarray) -> np.ndarray:
     """
-    Reproduces the training camera pipeline (noise-free):
+    Reproduces the training camera pipeline:
       1. mm → meters
       2. Mask low-confidence pixels → max sensor range (reads as 'far/clear')
-      3. Crop top 47.5%  (86 rows removed, 94 rows remain)
-      4. Bilinear downscale to 80 × 31
-      5. Normalize: 1.0 - depth_m / 5.0   (1=close/danger, 0=far/clear)
-
-    Returns float32 array of length 2480.
+      3. Crop top CROP_TOP_FRAC and bottom CROP_BOTTOM_FRAC rows
+      4. Bilinear downscale to POLICY_W × POLICY_H
+      5. Normalize: 1.0 - depth_m / (MAX_DISTANCE/1000)
     """
     depth_m = np.nan_to_num(depth_buf).astype(np.float32) / 1000.0
-    depth_m[conf_buf < CONF_THRESHOLD] = MAX_DISTANCE / 1000.0  # safe default: appears far
+    depth_m[conf_buf < CONF_THRESHOLD] = MAX_DISTANCE / 1000.0
 
-    cropped    = depth_m[CROP_TOP_ROWS:, :]                              # (94, 240)
-    resized    = cv2.resize(cropped, (POLICY_W, POLICY_H),               # cv2 takes (w, h)
-                            interpolation=cv2.INTER_LINEAR)              # (80, 31)
-    normalized = np.clip(1.0 - resized / 4.0, 0.0, 1.0)   # depth_max_m = 4.0 m, matches sim
-    return normalized.flatten().astype(np.float32)                       # 2480 values
+    cropped    = depth_m[CROP_TOP_ROWS : DEPTH_RAW_H - CROP_BOTTOM_ROWS, :]
+    resized    = cv2.resize(cropped, (POLICY_W, POLICY_H), interpolation=cv2.INTER_LINEAR)
+    normalized = np.clip(1.0 - resized / 4.0, 0.0, 1.0)
+    return normalized.flatten().astype(np.float32)
 
 
 # ── Camera capture (single thread, sequential) ───────────────────────────────
 
-def camera_thread() -> None:
-    """
-    Single thread captures all cameras sequentially.
-    The ArduCam SDK shares a C-level buffer across instances; concurrent
-    requestFrame calls cause both feeds to overlay each other regardless of
-    numpy copy strategy. Sequential capture avoids this entirely.
-    """
+def camera_worker(idx: int):
     while True:
-        # ── Open all cameras ──────────────────────────────────────────────────
-        cams: dict[int, tuple[ac.ArducamCamera, float]] = {}
-        for idx in CAMERA_INDICES:
-            try:
-                cam = ac.ArducamCamera()
-                if cam.open(ac.Connection.CSI, idx) != 0:
-                    print(f"Camera {idx}: failed to open")
-                    continue
-                cam.start(ac.FrameType.DEPTH)
-                cam.setControl(ac.Control.RANGE, MAX_DISTANCE)
-                depth_range = cam.getControl(ac.Control.RANGE)
-                for _ in range(WARMUP_FRAMES):
-                    f = cam.requestFrame(2000)
-                    if f is not None:
-                        cam.releaseFrame(f)
-                cams[idx] = (cam, depth_range)
-                print(f"Camera {idx}: ready")
-            except Exception as exc:
-                print(f"Camera {idx}: init error {exc!r}")
-
-        if not cams:
-            print("No cameras opened, retrying in 2s")
-            time.sleep(2)
-            continue
-
-        # ── Capture loop: one camera at a time ────────────────────────────────
         try:
+            cam = ac.ArducamCamera()
+            if cam.open(ac.Connection.CSI, idx) != 0:
+                print(f"Camera {idx}: failed to open")
+                time.sleep(2)
+                continue
+
+            cam.start(ac.FrameType.DEPTH)
+            cam.setControl(ac.Control.RANGE, MAX_DISTANCE)
+            depth_range = cam.getControl(ac.Control.RANGE)
+
+            for _ in range(WARMUP_FRAMES):
+                f = cam.requestFrame(2000)
+                if f is not None:
+                    cam.releaseFrame(f)
+
+            print(f"Camera {idx}: ready")
+
             while True:
-                for idx, (cam, depth_range) in cams.items():
-                    frame = cam.requestFrame(2000)
-                    if frame is None or not isinstance(frame, ac.DepthData):
-                        continue
+                frame = cam.requestFrame(2000)
+                if frame is None or not isinstance(frame, ac.DepthData):
+                    continue
 
-                    # CRITICAL: copy AND process BEFORE releasing or switching camera
-                    depth_buf = np.array(frame.depth_data,      dtype=np.float32).copy()
-                    conf_buf  = np.array(frame.confidence_data, dtype=np.uint8).copy()
+                # 🔒 CRITICAL: isolate memory immediately
+                depth_buf = np.array(frame.depth_data, copy=True).astype(np.float32, copy=False)
+                conf_buf  = np.array(frame.confidence_data, copy=True)
 
-                    # Process immediately while memory is still valid
-                    jpeg = depth_to_jpeg(depth_buf, conf_buf, depth_range)
+                cam.releaseFrame(frame)
 
-                    # Flip raw arrays 180° for policy (cameras physically mounted upside down)
-                    depth_flipped = np.ascontiguousarray(np.flip(depth_buf, (0, 1)))
-                    conf_flipped  = np.ascontiguousarray(np.flip(conf_buf,  (0, 1)))
+                jpeg = depth_to_jpeg(depth_buf, conf_buf, depth_range)
 
-                    cam.releaseFrame(frame)  # release ONLY after processing
+                depth_flipped = np.ascontiguousarray(np.flip(depth_buf, (0, 1)))
+                conf_flipped  = np.ascontiguousarray(np.flip(conf_buf,  (0, 1)))
 
-                    with frames_lock:
-                        latest_frames[idx] = jpeg
-                        latest_raw[idx]    = (depth_flipped, conf_flipped)
+                with frames_lock:
+                    latest_frames[idx] = jpeg
+                    latest_raw[idx]    = (depth_flipped, conf_flipped)
 
-        except Exception as exc:
-            print(f"Camera thread error: {exc!r}, restarting in 2s")
-            for cam, _ in cams.values():
-                try:
-                    cam.stop()
-                    cam.close()
-                except Exception:
-                    pass
+        except Exception as e:
+            print(f"Camera {idx} error: {e}, restarting in 2s")
+            try:
+                cam.stop()
+                cam.close()
+            except:
+                pass
             time.sleep(2)
-
-
-# ── Robot / EV3 ───────────────────────────────────────────────────────────────
-
-class Robot:
-    """
-    EV3 port assignment:
-        PORT_A — steering motor
-        PORT_B — left drive motor
-        PORT_C — right drive motor
-    """
-
-    def __init__(self) -> None:
-        self._ev3    = ev3.EV3(protocol=ev3.USB)
-        self.steer   = ev3.Motor(ev3.PORT_D, ev3_obj=self._ev3)
-        self.drive_b = ev3.Motor(ev3.PORT_B, ev3_obj=self._ev3)
-        self.drive_c = ev3.Motor(ev3.PORT_C, ev3_obj=self._ev3)
-
-        self.steer.speed   = STEER_SPEED
-        self.drive_b.speed = DRIVE_SPEED
-        self.drive_c.speed = DRIVE_SPEED
-
-        self._steer_amplitude: float = 60.0  # matches manual_control.py
-
-    def set_steering(self, value: float) -> None:
-        """value in [-1, 1]; 0 = mechanical center."""
-        target = value * self._steer_amplitude * -1
-        self.steer.start_move_to(round(target), brake=True)
-
-    def drive(self, direction: int) -> None:
-        self.drive_b.start_move(direction=direction)
-        self.drive_c.start_move(direction=-direction)
-
-    def stop_drive(self) -> None:
-        self.drive_b.stop(brake=True)
-        self.drive_c.stop(brake=True)
-
-    def apply_action(self, throttle: float, steer: float) -> None:
-        """Apply a policy output.
-        throttle is clamped to [0, 1] — negative values mean zero torque (no reverse),
-        matching the sim's (action + 1) / 2 remapping where -1 → 0 torque.
-        steer in [-1, 1].
-        """
-        throttle = max(0.0, min(1.0, throttle))
-        if throttle > 0.02:
-            speed_pct = max(1, round(throttle * 100))
-            self.drive_b.speed = speed_pct
-            self.drive_c.speed = speed_pct
-            self.drive(1)
-        else:
-            self.stop_drive()
-        self.set_steering(steer)
-
-    def shutdown(self) -> None:
-        self.drive_b.stop(brake=False)
-        self.drive_c.stop(brake=False)
-        self.steer.stop(brake=False)
 
 
 # ── Policy loop ───────────────────────────────────────────────────────────────
@@ -260,9 +181,9 @@ def policy_thread() -> None:
         t_start = time.perf_counter()
 
         if not space_active.is_set():
-            # Not active: coast all motors and zero action history for a clean restart
-            robot.stop_drive()
-            robot.steer.stop(brake=False)
+            # Not active: zero throttle, disable servo, clear history for clean restart
+            robot.set_throttle(0)
+            robot.servo_pwm.ChangeDutyCycle(0)
             action_history[:] = 0.0
             with action_lock:
                 latest_action[0] = 0.0
@@ -286,11 +207,12 @@ def policy_thread() -> None:
 
         action = sess.run([output_name], {input_name: obs})[0].clip(-1.0, 1.0)[0]
         throttle_raw, steer = float(action[0]), float(action[1])
-        # Clamp throttle to [0, 1] for the motor — negative output means zero torque,
+        # Clamp throttle to [0, 1] — negative output means zero torque,
         # matching the sim's (raw + 1) / 2 remapping where raw=-1 → throttle_norm=0.
         throttle_motor = max(0.0, throttle_raw)
 
-        robot.apply_action(throttle_motor, steer)
+        robot.set_throttle(throttle_motor)
+        robot.set_steering(steer)
 
         # Store RAW policy output in history (matches sim: _prev_action stores actions ∈ [-1, 1])
         action_history = np.roll(action_history, -2)
@@ -560,9 +482,11 @@ async def on_cleanup(app: web.Application) -> None:
 def main() -> None:
     global robot
 
-    threading.Thread(target=camera_thread, daemon=True).start()
+    for idx in CAMERA_INDICES:
+        threading.Thread(target=camera_worker, args=(idx,), daemon=True).start()
 
     robot = Robot()
+    print("Hardware initialised.")
 
     threading.Thread(target=policy_thread, daemon=True).start()
 
@@ -578,7 +502,8 @@ def main() -> None:
         web.run_app(app, host=HOST, port=PORT)
     finally:
         space_active.clear()
-        robot.shutdown()
+        if robot:
+            robot.stop()
 
 
 if __name__ == "__main__":

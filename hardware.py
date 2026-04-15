@@ -16,7 +16,7 @@ class Robot:
         servo_amplitude=0.25,
         servo_direction=1,
         motor_direction=-1,
-        max_throttle=0.2
+        max_throttle=0.1
     ):
         # Store config
         self.pwm_motor_pin = pwm_motor_pin
