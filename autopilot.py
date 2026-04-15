@@ -45,11 +45,13 @@ POLICY_HZ      = 30
 # ── Depth processing constants (must match training pipeline) ─────────────────
 DEPTH_RAW_H    = 180
 DEPTH_RAW_W    = 240
-CROP_TOP_FRAC  = 0.475          # remove top 47.5%
+CROP_TOP_FRAC  = 0.625          # remove top 47.5%
 POLICY_W       = 80
-CROPPED_H      = round(DEPTH_RAW_H * (1.0 - CROP_TOP_FRAC))   # 94 rows
-CROP_TOP_ROWS  = DEPTH_RAW_H - CROPPED_H                       # 86 rows removed
-POLICY_H       = round(POLICY_W * CROPPED_H / DEPTH_RAW_W)     # 31
+# Crop: use int() truncation — mirrors sim's `int(fraction * h)` in _process_depth_frame.
+CROP_TOP_ROWS  = int(CROP_TOP_FRAC * DEPTH_RAW_H)                                   # 85 rows removed
+CROPPED_H      = DEPTH_RAW_H - CROP_TOP_ROWS                                        # 95 rows remain
+# Policy height: mirrors sim __init__ which uses int() on the remaining fraction.
+POLICY_H       = round(POLICY_W * int(DEPTH_RAW_H * (1.0 - CROP_TOP_FRAC)) / DEPTH_RAW_W)  # 31
 
 # ── Policy observation layout ─────────────────────────────────────────────────
 PER_CAM_DIM    = POLICY_W * POLICY_H   # 80*31 = 2480
@@ -106,7 +108,7 @@ def process_for_policy(depth_buf: np.ndarray, conf_buf: np.ndarray) -> np.ndarra
     cropped    = depth_m[CROP_TOP_ROWS:, :]                              # (94, 240)
     resized    = cv2.resize(cropped, (POLICY_W, POLICY_H),               # cv2 takes (w, h)
                             interpolation=cv2.INTER_LINEAR)              # (80, 31)
-    normalized = np.clip(1.0 - resized / 5.0, 0.0, 1.0)
+    normalized = np.clip(1.0 - resized / 4.0, 0.0, 1.0)   # depth_max_m = 4.0 m, matches sim
     return normalized.flatten().astype(np.float32)                       # 2480 values
 
 
@@ -193,7 +195,7 @@ class Robot:
 
     def __init__(self) -> None:
         self._ev3    = ev3.EV3(protocol=ev3.USB)
-        self.steer   = ev3.Motor(ev3.PORT_A, ev3_obj=self._ev3)
+        self.steer   = ev3.Motor(ev3.PORT_D, ev3_obj=self._ev3)
         self.drive_b = ev3.Motor(ev3.PORT_B, ev3_obj=self._ev3)
         self.drive_c = ev3.Motor(ev3.PORT_C, ev3_obj=self._ev3)
 
@@ -201,12 +203,11 @@ class Robot:
         self.drive_b.speed = DRIVE_SPEED
         self.drive_c.speed = DRIVE_SPEED
 
-        self._steer_center:    float = 0.0
-        self._steer_amplitude: float = 55.0  # matches manual_control.py
+        self._steer_amplitude: float = 60.0  # matches manual_control.py
 
     def set_steering(self, value: float) -> None:
         """value in [-1, 1]; 0 = mechanical center."""
-        target = self._steer_center + value * self._steer_amplitude
+        target = value * self._steer_amplitude * -1
         self.steer.start_move_to(round(target), brake=True)
 
     def drive(self, direction: int) -> None:
@@ -218,11 +219,17 @@ class Robot:
         self.drive_c.stop(brake=True)
 
     def apply_action(self, throttle: float, steer: float) -> None:
-        """Apply a policy output. throttle/steer in [-1, 1]."""
-        if throttle > 0.05:
+        """Apply a policy output.
+        throttle is clamped to [0, 1] — negative values mean zero torque (no reverse),
+        matching the sim's (action + 1) / 2 remapping where -1 → 0 torque.
+        steer in [-1, 1].
+        """
+        throttle = max(0.0, min(1.0, throttle))
+        if throttle > 0.02:
+            speed_pct = max(1, round(throttle * 100))
+            self.drive_b.speed = speed_pct
+            self.drive_c.speed = speed_pct
             self.drive(1)
-        elif throttle < -0.05:
-            self.drive(-1)
         else:
             self.stop_drive()
         self.set_steering(steer)
@@ -278,17 +285,20 @@ def policy_thread() -> None:
         obs = np.concatenate([left_obs, right_obs, action_history])[np.newaxis, :]  # (1, 4990)
 
         action = sess.run([output_name], {input_name: obs})[0].clip(-1.0, 1.0)[0]
-        throttle, steer = float(action[0]), float(action[1])
+        throttle_raw, steer = float(action[0]), float(action[1])
+        # Clamp throttle to [0, 1] for the motor — negative output means zero torque,
+        # matching the sim's (raw + 1) / 2 remapping where raw=-1 → throttle_norm=0.
+        throttle_motor = max(0.0, throttle_raw)
 
-        robot.apply_action(throttle, steer)
+        robot.apply_action(throttle_motor, steer)
 
-        # Shift history left by 2 and append the latest action
+        # Store RAW policy output in history (matches sim: _prev_action stores actions ∈ [-1, 1])
         action_history = np.roll(action_history, -2)
-        action_history[-2] = throttle
+        action_history[-2] = throttle_raw
         action_history[-1] = steer
 
         with action_lock:
-            latest_action[0] = throttle
+            latest_action[0] = throttle_motor
             latest_action[1] = steer
 
         elapsed = time.perf_counter() - t_start

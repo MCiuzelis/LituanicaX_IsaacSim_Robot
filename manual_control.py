@@ -142,7 +142,7 @@ class Robot:
 
     def __init__(self) -> None:
         self._ev3    = ev3.EV3(protocol=ev3.USB)
-        self.steer   = ev3.Motor(ev3.PORT_A, ev3_obj=self._ev3)
+        self.steer   = ev3.Motor(ev3.PORT_D, ev3_obj=self._ev3)
         self.drive_b = ev3.Motor(ev3.PORT_B, ev3_obj=self._ev3)
         self.drive_c = ev3.Motor(ev3.PORT_C, ev3_obj=self._ev3)
 
@@ -152,7 +152,7 @@ class Robot:
 
         # Set by calibrate_steering()
         self._steer_center: float    = 0.0
-        self._steer_amplitude: float = 55  # degrees, fallback default
+        self._steer_amplitude: float = 40  # degrees, fallback default
 
     def calibrate_steering(self) -> None:
         """
